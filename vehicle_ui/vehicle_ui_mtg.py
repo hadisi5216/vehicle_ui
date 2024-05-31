@@ -14,10 +14,12 @@ from ui.vehicle_mtg_ui import Ui_MainWindow
 
 import rclpy
 from rclpy.node import Node
+from rclpy.qos import QoSProfile,QoSReliabilityPolicy,QoSHistoryPolicy,QoSDurabilityPolicy
 
 from autoware_adapi_v1_msgs.msg import OperationModeState,RouteState,LocalizationInitializationState,MotionState
 from autoware_adapi_v1_msgs.srv import ChangeOperationMode,SetRoutePoints,ClearRoute
 from geometry_msgs.msg import Pose
+from std_msgs.msg import String
 
 class ActNode(Node, QObject):
     signal_operation_mode = pyqtSignal(object)
@@ -31,6 +33,12 @@ class ActNode(Node, QObject):
         super().__init__(name)
         QObject.__init__(self)  
         self.get_logger().info(f"__init__")
+        QOS_RKL10TL = QoSProfile(
+            reliability=QoSReliabilityPolicy.RELIABLE,
+            history=QoSHistoryPolicy.KEEP_LAST,
+            depth=10,
+            durability=QoSDurabilityPolicy.TRANSIENT_LOCAL,
+        )
         
         self.state_operation_mode               = self.create_subscription(OperationModeState,"/api/operation_mode/state",self.state_operation_mode_callback,10) 
         self.state_route                        = self.create_subscription(RouteState,"/api/routing/state",self.state_route_callback,10) 
@@ -46,26 +54,57 @@ class ActNode(Node, QObject):
         self.client_operation_mode_disable      = self.create_client(ChangeOperationMode,"/api/operation_mode/disable_autoware_control")
         self.client_routing_set_route_points    = self.create_client(SetRoutePoints,"/api/routing/set_route_points")
         self.client_routing_clear_route         = self.create_client(ClearRoute,"/api/routing/clear_route")
+        
+        # PAD远程
+        self.pad_status_operation_mode    = self.create_publisher(String,"/pad/status/operation_mode",QOS_RKL10TL)
+        self.pad_status_routing           = self.create_publisher(String,"/pad/status/routing",QOS_RKL10TL)
+        self.pad_status_localization      = self.create_publisher(String,"/pad/status/localization",QOS_RKL10TL)
+        self.pad_status_motion            = self.create_publisher(String,"/pad/status/motion",QOS_RKL10TL)
+        self.pad_status_station            = self.create_publisher(String,"/pad/status/station",QOS_RKL10TL)
+        self.pad_control_vehicle          = self.create_subscription(String,"/pad/control/vehicle",self.pad_control_vehicle_callback,10) 
+        self.pad_control_station          = self.create_subscription(String,"/pad/control/station",self.pad_control_station_callback,10) 
   
+    # PAD控制车辆指令 
+    def pad_control_vehicle_callback(self, msg):
+        self.get_logger().info(f"收到PAD发送指令: {msg.data}") 
+        self.change_operation_mode(msg.data)
+        
+    # PAD控制站点指令 
+    def pad_control_station_callback(self, msg):
+        self.get_logger().info(f"收到PAD发送指令: {msg.data}") 
+        self.change_station(msg.data)
+        
     # 操作模式状态 mode：UNKNOWN = 0 | STOP = 1 | AUTONOMOUS = 2 | LOCAL = 3 | REMOTE = 4
     def state_operation_mode_callback(self, msg):
         self.get_logger().info(f"/api/operation_mode/state: {msg.mode}")
-        self.signal_operation_mode.emit(msg)        
+        self.signal_operation_mode.emit(msg)  
+        msgOM = String()
+        msgOM.data = str(msg.mode)
+        self.pad_status_operation_mode.publish(msgOM)    
      
     # Routing状态 state：UNKNOWN = 0 | UNSET = 1 | SET = 2 | ARRIVED = 3 | CHANGING = 4
     def state_route_callback(self, msg):
         self.get_logger().info(f"/api/routing/state: {msg.state}")
         self.signal_route.emit(msg.state)
+        msgR = String()
+        msgR.data = str(msg.state)
+        self.pad_status_routing.publish(msgR)  
      
     # Localization状态 state：UNKNOWN = 0 | UNINITIALIZED = 1 | INITIALIZING = 2 | INITIALIZED = 3
     def state_localization_callback(self, msg):
         self.get_logger().info(f"/api/localization/initialization_state: {msg.state}")
         self.signal_initialization.emit(msg.state)
+        msgL = String()
+        msgL.data = str(msg.state)
+        self.pad_status_localization.publish(msgL)  
         
     # Motion车辆运动状态 state：UNKNOWN = 0 | STOPPED = 1 | STARTING = 2 | MOVING = 3
     def state_motion_callback(self, msg):
         self.get_logger().info(f"/api/motion/state: {msg.state}")
         self.signal_motion.emit(msg.state)
+        msgM = String()
+        msgM.data = str(msg.state)
+        self.pad_status_motion.publish(msgM)  
     
     # 改变操作模式    
     def change_operation_mode(self, key):
@@ -106,10 +145,15 @@ class ActNode(Node, QObject):
         while rclpy.ok() and self.client_routing_clear_route.wait_for_service(1)==False:
             pass
         request = ClearRoute.Request()
-        self.client_routing_clear_route.call_async(request).add_done_callback(self.result_callback)
-            
-    # 切换站点      
+        self.client_routing_clear_route.call_async(request).add_done_callback(self.result_callback_clear_router)
+     
+    # 切换站点   
     def change_station(self, stationId):
+        self.stationId = stationId
+        self.clear_router()
+            
+    # set_route_points      
+    def set_route_points(self):
         while rclpy.ok() and self.client_routing_set_route_points.wait_for_service(1)==False:
             self.get_logger().info(f"Wait for the server to go online....")
         request = SetRoutePoints.Request()
@@ -117,9 +161,8 @@ class ActNode(Node, QObject):
         request.header.frame_id = "map"
         request.option.allow_goal_modification = False
         goal = Pose()
-        self.stationId = stationId
-        if(stationId == 1):
-            goal.position
+        
+        if(self.stationId == 1):
             goal.position.x = 36.7334
             goal.position.y = 51.8838
             goal.position.z = 0.0
@@ -127,8 +170,7 @@ class ActNode(Node, QObject):
             goal.orientation.y = 0.0
             goal.orientation.z = 0.0920319
             goal.orientation.w = 0.995756
-        elif(stationId == 2):
-            goal.position
+        elif(self.stationId == 2):
             goal.position.x = 29.6334
             goal.position.y = 36.9838
             goal.position.z = 0.0
@@ -136,8 +178,7 @@ class ActNode(Node, QObject):
             goal.orientation.y = 0.0
             goal.orientation.z = -0.625727
             goal.orientation.w = 0.780042
-        elif(stationId == 3):
-            goal.position
+        elif(self.stationId == 3):
             goal.position.x = 87.0334
             goal.position.y = 15.9838
             goal.position.z = 0.0
@@ -145,8 +186,7 @@ class ActNode(Node, QObject):
             goal.orientation.y = 0.0
             goal.orientation.z = -0.63399
             goal.orientation.w = 0.773342
-        elif(stationId == 4):
-            goal.position
+        elif(self.stationId == 4):
             goal.position.x = -7.7666
             goal.position.y = -22.5162
             goal.position.z = 0.0
@@ -162,12 +202,23 @@ class ActNode(Node, QObject):
         response = result_future.result()
         self.get_logger().info(f"收到返回结果：{response}")
         self.signal_result_control.emit(response.status)
+        
+    # 清除router请求结果    
+    def result_callback_clear_router(self, result_future):
+        response = result_future.result()
+        self.get_logger().info(f"收到返回结果：{response}")
+        self.signal_result_control.emit(response.status)
+        if(response.status.success == True):
+            self.set_route_points()
     
     # 站点client请求结果    
     def result_callback_station(self, result_future):
         response = result_future.result()
         self.get_logger().info(f"收到返回结果：{self.stationId}--{response}")
         self.signal_result_station.emit(self.stationId, response.status)
+        msgS = String()
+        msgS.data = str(self.stationId)
+        self.pad_status_operation_mode.publish(msgS) 
         
         
 class MainWindow(QMainWindow, Ui_MainWindow):
